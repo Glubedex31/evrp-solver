@@ -649,44 +649,72 @@ def evaluate_realized_route(
 ) -> RouteResult:
     return simulate_realized_route(instance, realized_nodes, policy, expected_customers)
 
-
-def evaluate_route(
+def _greedy_insert_chargers(
     instance: Instance,
-    route: Route,
+    customers: Sequence[str],
     policy: ChargingPolicy,
-    cache: Optional[Dict[Tuple[Tuple[str, ...], str], RouteResult]] = None,
+) -> Optional[List[str]]:
+    """Greedily insert charging stations into a customer sequence."""
+    realized: List[str] = [instance.depot]
+    soc = instance.battery_capacity
+    targets = list(customers) + [instance.depot]
+    idx = 0
+    recently_inserted: set = set()
+
+    while idx < len(targets):
+        current = realized[-1]
+        target = targets[idx]
+        needed = energy_needed(instance, current, target)
+
+        if soc + EPSILON >= needed:
+            realized.append(target)
+            soc -= needed
+            idx += 1
+            recently_inserted.clear()
+        else:
+            best_charger = None
+            best_cost = float("inf")
+
+            for charger_id in instance.chargers:
+                if charger_id == current or charger_id in recently_inserted:
+                    continue
+                e_to_c = energy_needed(instance, current, charger_id)
+                if e_to_c > soc + EPSILON:
+                    continue
+                soc_at_c = soc - e_to_c
+                e_c_to_t = energy_needed(instance, charger_id, target)
+                charged = policy.recharge_target(soc_at_c, e_c_to_t, instance.battery_capacity)
+                charged = max(charged, soc_at_c)
+                if charged + EPSILON < e_c_to_t:
+                    continue
+                cost = (instance.distances[(current, charger_id)]
+                        + instance.distances[(charger_id, target)])
+                if cost < best_cost:
+                    best_cost = cost
+                    best_charger = charger_id
+
+            if best_charger is None:
+                return None
+
+            recently_inserted.add(best_charger)
+            e_to_c = energy_needed(instance, current, best_charger)
+            soc_at_c = soc - e_to_c
+            e_c_to_t = energy_needed(instance, best_charger, target)
+            charged = policy.recharge_target(soc_at_c, e_c_to_t, instance.battery_capacity)
+            soc = max(charged, soc_at_c)
+            realized.append(best_charger)
+
+    return realized
+
+
+def _label_setting_insert_chargers(
+    instance: Instance,
+    customers: Sequence[str],
+    policy: ChargingPolicy,
     max_zero_hops: int = 3,
     deadline: Optional[float] = None,
-) -> RouteResult:
-    _check_deadline(deadline)
-    customers = tuple(customer for customer in route.customers if customer)
-    if not customers:
-        return RouteResult(
-            customers=[],
-            realized_nodes=[instance.depot, instance.depot],
-            events=[],
-            feasible=True,
-            total_distance=0.0,
-            charger_visits=0,
-            objective=ObjectiveValue(0.0, 0, 0),
-        )
-
-    if len(set(customers)) != len(customers):
-        return RouteResult(
-            customers=list(customers),
-            realized_nodes=[],
-            events=[],
-            feasible=False,
-            total_distance=float("inf"),
-            charger_visits=10**9,
-            objective=ObjectiveValue.infinity(),
-            message="Repeated customers are not allowed inside one route.",
-        )
-
-    cache_key = (customers, policy.policy_id())
-    if cache is not None and cache_key in cache:
-        return cache[cache_key]
-
+) -> Optional[Tuple[str, ...]]:
+    """Exact charger insertion via label-setting. Used as a fallback when greedy fails."""
     n_customers = len(customers)
     prefix = _customer_prefix_distances(instance, customers)
     priority_queue: List[Tuple[float, float, int, float, int, _Label]] = []
@@ -838,6 +866,62 @@ def evaluate_route(
             )
 
     if not final_labels:
+        return None
+
+    best_label = min(final_labels, key=lambda item: (item.total_distance, item.charger_visits, item.time_value))
+    return best_label.route_nodes
+
+
+def evaluate_route(
+    instance: Instance,
+    route: Route,
+    policy: ChargingPolicy,
+    cache: Optional[Dict[Tuple[Tuple[str, ...], str], RouteResult]] = None,
+    max_zero_hops: int = 3,
+    deadline: Optional[float] = None,
+) -> RouteResult:
+    _check_deadline(deadline)
+    customers = tuple(customer for customer in route.customers if customer)
+    if not customers:
+        return RouteResult(
+            customers=[],
+            realized_nodes=[instance.depot, instance.depot],
+            events=[],
+            feasible=True,
+            total_distance=0.0,
+            charger_visits=0,
+            objective=ObjectiveValue(0.0, 0, 0),
+        )
+
+    if len(set(customers)) != len(customers):
+        return RouteResult(
+            customers=list(customers),
+            realized_nodes=[],
+            events=[],
+            feasible=False,
+            total_distance=float("inf"),
+            charger_visits=10**9,
+            objective=ObjectiveValue.infinity(),
+            message="Repeated customers are not allowed inside one route.",
+        )
+
+    cache_key = (customers, policy.policy_id())
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    realized = _greedy_insert_chargers(instance, customers, policy)
+    if realized is not None:
+        greedy_result = simulate_realized_route(instance, realized, policy, customers)
+        if greedy_result.feasible:
+            if cache is not None:
+                cache[cache_key] = greedy_result
+            return greedy_result
+
+    # Fallback: exact label-setting search when greedy fails (rare, hard instances).
+    fallback_nodes = _label_setting_insert_chargers(
+        instance, customers, policy, max_zero_hops=max_zero_hops, deadline=deadline
+    )
+    if fallback_nodes is None:
         result = RouteResult(
             customers=list(customers),
             realized_nodes=[],
@@ -846,18 +930,16 @@ def evaluate_route(
             total_distance=float("inf"),
             charger_visits=10**9,
             objective=ObjectiveValue.infinity(),
-            message="No feasible charger realization found for the customer order.",
+            message="No feasible charger insertion found for the customer order.",
         )
         if cache is not None:
             cache[cache_key] = result
         return result
 
-    best_label = min(final_labels, key=lambda item: (item.total_distance, item.charger_visits, item.time_value))
-    result = simulate_realized_route(instance, best_label.route_nodes, policy, customers)
+    result = simulate_realized_route(instance, fallback_nodes, policy, customers)
     if cache is not None:
         cache[cache_key] = result
     return result
-
 
 def evaluate_solution(
     instance: Instance,
